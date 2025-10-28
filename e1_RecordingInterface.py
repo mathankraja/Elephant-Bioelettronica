@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
-# ─── Elephant Brain Labs — E1 Real-Time Amplifier Viewer ─────────────────────
-# Simple live visualizer for OT Bioelettronica E1 amplifier
-# - Streams 32-ch EEG and auxiliary sensors (PPG, EDA, Temp)
-# - Shows connection status, auto-reconnect, and mode (EEG / Impedance)
-# - MATLAB-faithful amplitude conversions, no filters, autoscaling
-#
-# pip install pyserial numpy dash plotly
-# python e1_minimal.py
-#
+# ─── Elephant Brain Labs — E1 Real-Time EEG Recorder (Viewer + EDF+) ─────────
+# Adds: filename input, Start/Stop recording (32 EEG channels, µV), Event 1..4 annotations
+# Plus: Left header logo + favicon (tab icon)
+# Requires: pip install pyedflib numpy dash plotly pyserial
 # Author: @Mathan K. Raja  Elephant Brain Labs • October 2025
 
-import argparse, threading, time, atexit, os
+import argparse, threading, time, atexit, os, datetime, base64
 from collections import deque
-from typing import Optional
+from typing import Optional, List, Tuple
 import numpy as np
 import serial
 from serial.tools import list_ports
 from dash import Dash, html, dcc, Output, Input, State, callback_context
 import plotly.graph_objects as go
-import base64
+import pyedflib
 
 # --------------------- CLI ---------------------
-p = argparse.ArgumentParser(description="Elephant Brain Labs — E1 Real-Time Amplifier Viewer")
+p = argparse.ArgumentParser(
+    description="Elephant Brain Labs — E1 Real-Time EEG Recorder (Viewer + EDF+)"
+)
 p.add_argument("--default_port", default="COM13", help="Default serial port (MATLAB used COM13)")
 p.add_argument("--fs", type=int, default=250, help="Sample rate (Hz)")
 p.add_argument("--refresh", type=float, default=0.2, help="Chunk seconds")
@@ -136,9 +133,78 @@ imp_r_hist  = deque(maxlen=max_cols)
 imp_eda_hist= deque(maxlen=max_cols)
 stop_event = threading.Event()
 
+# --------- Recording state ---------
+recording = False
+rec_start_time: float = 0.0
+rec_ch_buffers: List[List[float]] = [[] for _ in range(NUM_CH_EEG)]  # store EEG in µV
+rec_events: List[Tuple[float,str]] = []  # (onset_seconds, "Event N")
+last_saved_path: Optional[str] = None
+
+def _reset_recording():
+    global rec_ch_buffers, rec_events, rec_start_time
+    rec_ch_buffers = [[] for _ in range(NUM_CH_EEG)]
+    rec_events = []
+    rec_start_time = time.time()
+
+def _timestamped_edf_path(base: str) -> str:
+    base = (base or "session").strip()
+    ts   = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    root, ext = os.path.splitext(base)
+    if ext.lower() not in (".edf", ".edf+"):
+        ext = ".edf"
+    return f"{root}_{ts}{ext}"
+
+def _write_edf_plus(path: str):
+    """Write all buffered EEG (µV) to EDF+ with annotations."""
+    n_ch = NUM_CH_EEG
+    fs   = args.fs
+    if n_ch == 0:
+        raise RuntimeError("No channels configured")
+
+    min_len = min(len(x) for x in rec_ch_buffers) if rec_ch_buffers else 0
+    sigs = [np.asarray(x[:min_len], dtype=np.float64) for x in rec_ch_buffers]
+
+    # Physical range in µV (mapped from 24-bit)
+    phys_min = -8388608 * (CONV_EEG_MV * 1000.0)
+    phys_max =  8388607 * (CONV_EEG_MV * 1000.0)
+
+    signal_headers = []
+    for i in range(n_ch):
+        signal_headers.append({
+            "label": f"Ch{i+1}",
+            "dimension": "uV",
+            "sample_rate": fs,
+            "physical_min": phys_min,
+            "physical_max": phys_max,
+            "digital_min": -32768,
+            "digital_max":  32767,
+            "transducer": "",
+            "prefilter":  ""
+        })
+
+    f = pyedflib.EdfWriter(path, n_ch, file_type=pyedflib.FILETYPE_EDFPLUS)
+    f.setHeader({
+        "technician": "Elephant Brain Labs",
+        "recording_additional": "E1 32ch EEG",
+        "patientname": "",
+        "patient_additional": "",
+        "equipment": "OT Bioelettronica E1"
+    })
+    f.setSignalHeaders(signal_headers)
+
+    if hasattr(f, "writePhysicalSamples"):
+        f.writePhysicalSamples(sigs)
+    else:
+        f.writeSamples(sigs)
+
+    for onset, label in rec_events:
+        f.writeAnnotation(float(onset), 0.0, label)
+
+    f.close()
+
 def stream_worker():
     """Read data continuously if connected."""
-    global eeg_buf
+    global eeg_buf, recording
     rows = np.arange(NUM_CH_TOT*3).reshape(NUM_CH_TOT,3)
     while not stop_event.is_set():
         with ser_lock:
@@ -155,12 +221,23 @@ def stream_worker():
             vals = bytes24_to_int32(msb, mid, lsb)
         except Exception:
             continue
+
         out = np.zeros((NUM_CH_TOT, ns+1), dtype=np.int32)
         out[:,1:] = vals
         out[:,0]  = out[:,1]
         eeg_buf = np.hstack([eeg_buf, out]) if eeg_buf.size else out
         if eeg_buf.shape[1] > max_cols:
             eeg_buf = eeg_buf[:, -max_cols:]
+
+        # If recording, append all EEG channels (converted to µV)
+        if recording:
+            eeg_uv_block = out[:NUM_CH_EEG, :].astype(np.float32) * (CONV_EEG_MV * 1000.0)
+            for j in range(eeg_uv_block.shape[1]):
+                col = eeg_uv_block[:, j]
+                for k in range(NUM_CH_EEG):
+                    rec_ch_buffers[k].append(float(col[k]))
+
+        # impedance calc unchanged
         if mode_current == 2:
             eda_raw = out[IDX_EDA,:].astype(np.int32)
             InSine  = np.floor(eda_raw/4096).astype(np.float32)
@@ -184,25 +261,40 @@ def list_serial_options():
         opts = [{"label": args.default_port+" (default)", "value": args.default_port}] + opts
     return opts
 
-# optional logo
-encoded_logo = ""
-for candidate in ["logo.png", "assets/logo.png"]:
-    if os.path.exists(candidate):
-        with open(candidate, "rb") as f:
-            encoded_logo = base64.b64encode(f.read()).decode()
+# Load header logo (left). Prefer assets/logo.png, else logo.png in CWD.
+def _load_logo_b64() -> str:
+    for candidate in ["assets/logo.png", "logo.png", "assets/logo.jpg", "logo.jpg"]:
+        if os.path.exists(candidate):
+            with open(candidate, "rb") as f:
+                return base64.b64encode(f.read()).decode()
+    return ""
 
-app = Dash(__name__)
-app.title = "Elephant Brain Labs — E1 Real-Time Amplifier Viewer"
+# App + favicon
+app = Dash(__name__, assets_folder="assets")
+app.title = "Elephant Brain Labs — E1 Real-Time EEG Recorder"
+
+# If you use a non-default favicon name, set it here (assets/favicon.png or .ico)
+if os.path.exists(os.path.join("assets", "favicon.png")):
+    app._favicon = "favicon.png"
+elif os.path.exists(os.path.join("assets", "favicon.ico")):
+    app._favicon = "favicon.ico"
+
+encoded_logo = _load_logo_b64()
 
 app.layout = html.Div([
+    # Header with left logo + titles
     html.Div([
-        html.Img(src=f"data:image/png;base64,{encoded_logo}", style={'height':'56px','marginRight':'12px'}) if encoded_logo else html.Div(),
+        (html.Img(
+            src=f"data:image/png;base64,{encoded_logo}",
+            style={'height': '56px', 'marginRight': '12px'}
+         ) if encoded_logo else html.Div()),
         html.Div([
             html.H2("Elephant Brain Labs", style={'color':'#1E90FF','margin':'0'}),
-            html.H3("E1 Real-Time Amplifier Viewer", style={'margin':'0','fontWeight':'bold'})
+            html.H3("E1 Real-Time EEG Recorder (32-ch, EDF+)", style={'margin':'0','fontWeight':'bold'})
         ])
     ], style={'display':'flex','alignItems':'center','gap':'10px','marginBottom':'10px'}),
 
+    # Connection controls
     html.Div([
         dcc.Dropdown(id="port-dd", clearable=False, style={'width':'220px','display':'inline-block'}),
         html.Button("Refresh Ports", id="btn-refresh", n_clicks=0, style={'marginLeft':'8px'}),
@@ -213,8 +305,26 @@ app.layout = html.Div([
         html.Span(id="status-text", style={'marginLeft':'16px','fontWeight':'bold'})
     ], style={'marginBottom':'8px'}),
 
+    # Recording controls and events
+    html.Div([
+        html.Label("File base name"),
+        dcc.Input(id="fname", type="text", value="session", style={'width':'220px','marginRight':'8px'}),
+        html.Button("Start Recording", id="btn-start", n_clicks=0,
+                    style={'marginRight':'6px','background':'#198754','color':'white'}),
+        html.Button("Stop Recording",  id="btn-stop",  n_clicks=0,
+                    style={'background':'#dc3545','color':'white','marginRight':'12px'}),
+        html.Span("Recording: OFF", id="rec-status", style={'fontWeight':'bold','marginRight':'12px'}),
+        html.Button("Event 1", id="ev1", n_clicks=0, style={'marginRight':'6px'}),
+        html.Button("Event 2", id="ev2", n_clicks=0, style={'marginRight':'6px'}),
+        html.Button("Event 3", id="ev3", n_clicks=0, style={'marginRight':'6px'}),
+        html.Button("Event 4", id="ev4", n_clicks=0, style={'marginRight':'6px'}),
+        html.Span(id="ev-count", style={'marginLeft':'8px'})
+    ], style={'marginBottom':'10px'}),
+
     dcc.Store(id="store-port", data=args.default_port),
     dcc.Store(id="store-auto", data=True),
+    dcc.Store(id="store-lastpath", data=""),
+
     dcc.Interval(id="interval-status", interval=500, n_intervals=0),
 
     dcc.Graph(id="graph-eeg", style={'height':'460px'}),
@@ -279,6 +389,61 @@ def status_tick(_n, port_val, auto_val):
     if not connected and auto_val:
         txt = f"Connecting to {port_val}…  " + (f"(last error: {last_error})" if last_error else "")
     return txt
+
+# Recording controls & events
+@app.callback(
+    Output("rec-status", "children"),
+    Output("ev-count", "children"),
+    Output("store-lastpath", "data"),
+    Input("btn-start", "n_clicks"),
+    Input("btn-stop",  "n_clicks"),
+    Input("ev1", "n_clicks"),
+    Input("ev2", "n_clicks"),
+    Input("ev3", "n_clicks"),
+    Input("ev4", "n_clicks"),
+    State("fname", "value"),
+    State("store-lastpath", "data"),
+    prevent_initial_call=True
+)
+def recording_controls(n_start, n_stop, n1, n2, n3, n4, base_name, last_path):
+    global recording, last_saved_path
+    trig = [t["prop_id"] for t in callback_context.triggered][0]
+
+    # Start
+    if "btn-start" in trig:
+        if not recording:
+            _reset_recording()
+            recording = True
+        return ("Recording: ON", f"Events: {len(rec_events)}", last_path or "")
+
+    # Stop -> save EDF+
+    if "btn-stop" in trig:
+        if recording:
+            recording = False
+            out_path = _timestamped_edf_path(base_name or "session")
+            try:
+                _write_edf_plus(out_path)
+                last_saved_path = out_path
+                return (f"Recording: OFF (saved {os.path.basename(out_path)})",
+                        f"Events: {len(rec_events)}",
+                        out_path)
+            except Exception as e:
+                return (f"Recording: OFF (save failed: {e})",
+                        f"Events: {len(rec_events)}",
+                        last_path or "")
+        return ("Recording: OFF", f"Events: {len(rec_events)}", last_path or "")
+
+    # Events -> EDF+ annotations (only if recording)
+    if recording and any(k in trig for k in ["ev1.n_clicks","ev2.n_clicks","ev3.n_clicks","ev4.n_clicks"]):
+        label = "Event 1" if "ev1" in trig else "Event 2" if "ev2" in trig else "Event 3" if "ev3" in trig else "Event 4"
+        onset = time.time() - rec_start_time
+        rec_events.append((float(onset), label))
+        return ("Recording: ON", f"Events: {len(rec_events)}", last_path or "")
+
+    # no-op
+    return ("Recording: ON" if recording else "Recording: OFF",
+            f"Events: {len(rec_events)}",
+            last_path or "")
 
 @app.callback(
     Output("graph-eeg","figure"),
